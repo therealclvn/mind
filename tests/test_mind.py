@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import builtins
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -760,6 +761,73 @@ class TestAuditFindings2(TmpDirTest):
         with self.assertRaises(ValueError):
             h.remember("attacker-triggered write")
         self.assertEqual(victim.read_text("utf-8"), "precious")
+
+    def test_save_uses_msvcrt_lock_when_fcntl_is_unavailable(self):
+        """Windows must get a real file lock, not atomic-write-only saves."""
+        h = self.hippo()
+        calls = []
+
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, nbytes):
+                calls.append((mode, nbytes))
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl is not available")
+            if name == "msvcrt":
+                return FakeMsvcrt
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = fake_import
+        try:
+            h.remember("portable windows lock")
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertEqual(calls, [(FakeMsvcrt.LK_LOCK, 1),
+                                 (FakeMsvcrt.LK_UNLCK, 1)])
+
+    def test_save_retries_contended_msvcrt_lock(self):
+        """msvcrt.LK_LOCK eventually raises under contention; keep waiting
+        to match fcntl.flock semantics instead of failing the save."""
+        h = self.hippo()
+        calls = []
+
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, nbytes):
+                calls.append((mode, nbytes))
+                if mode == FakeMsvcrt.LK_LOCK and calls.count((mode, nbytes)) == 1:
+                    raise OSError("temporarily locked")
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl is not available")
+            if name == "msvcrt":
+                return FakeMsvcrt
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = fake_import
+        try:
+            h.remember("retry contended windows lock")
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertTrue((self.mind_dir / "graph.json").exists())
+        self.assertEqual(calls, [(FakeMsvcrt.LK_LOCK, 1),
+                                 (FakeMsvcrt.LK_LOCK, 1),
+                                 (FakeMsvcrt.LK_UNLCK, 1)])
 
     def test_archive_symlink_blocks_pruning(self):
         """'archived, not destroyed' is a guarantee: if the archive cannot
